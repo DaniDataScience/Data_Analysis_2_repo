@@ -1,12 +1,12 @@
-##################
-# Assignment 2   #
-#                #
-#                # 
-#                #
-##################
-
-### IMPORTING & LOADING # PREPARING DATASET
-
+---
+title: "Data Analysis 2 - Assignment 2"
+output:
+  pdf_document:
+    extra_dependencies: float
+  html_document:
+    df_print: paged
+---
+```{r setup, include=FALSE}
 rm(list=ls())
 
 library(kableExtra)
@@ -15,7 +15,7 @@ library(huxtable)
 library(modelsummary)
 library(lspline)
 library(mfx)
-
+library(data.table)
 
 # load in data and create workfile
 hotels_europe_price <- read_csv("https://raw.githubusercontent.com/DaniDataScience/Data_Analysis_2_repo/main/Assignment_2/hotels-europe_price.csv")
@@ -26,6 +26,22 @@ data<-data[!duplicated(data),]
 rm(hotels_europe_price)
 rm(hotels_europe_features)
 
+```
+## Introduction
+
+This is a probability analysis on hotel ratings in Rome in 2018, that aims to uncover the relationship between hotel ratings being high or not, with regards to  key attributes. The goal is  examine how high rating is related to the other hotel features, and predict the probability of a hotel being rated higher than 4.0.
+
+## Executive summary
+If our goal is to achieve a higher rating for our hotel with the least minimum resources (cost), we should select a location around 2.8 km away from the city center, and have as many stars as possible (assuming that gaining one star has an equal cost despite location, and real estate is more costly towards the center) 
+
+## Potential improvements to the model
+- include price, or overpriced / underpriced binary variable (from linear regression) 
+- include interactions between stars and distance, to see in which distance segment is it more beneficial to spend more money on one extra star
+
+## Data
+
+The dataset used is the hotels europe dataset, accessable here: https://osf.io/r6uqb/, and the city in scope is Rome.
+```{r, echo=FALSE, include=FALSE}
 ###############################################
 ### SELECTING AND TRANSFORMING OBSERVATIONS ###
 ###############################################
@@ -57,16 +73,20 @@ ggplot(hotels_Rome, aes(x=price))+
 
 ggplot(hotels_Rome, aes(x=distance2))+
   geom_histogram(binwidth = 0.1)
+```
+I have narrowed down the dataset to 2972 observations: hotels in 2018, below price of 650 USD, maximum 10 km from the center, with at least 10 ratings. I selected a single year to prevent time inconsistencies, e.g. new hotel built or old one renovated. Forbetter interpretation, I excluded c.20 hotels with 3.5 starts. The price and distance was restricted after examining the distributions (out of scope)
 
+My left-hand side variable is a binomial variable, highly_rated, which is equal to 1 if rating is above 4.0, and is 0 otherwise.
+
+## Preliminary analysis
+
+I examined the selected explanatory variables (distance and number of stars) to decide how to include them in the final models,
+
+Distance: Given the shape of the loess function, should be included as linear spline with knots at 1.5 and 2.8
+```{r, echo=FALSE, warning=FALSE, message = FALSE, fig.width=8, fig.height = 3, fig.align="center" }
 ###############################################
 ### SIMPLE LPM MODELS                       ###
 ###############################################
-
-# key parameters to consider
-## distance2
-## stars
-
-# checking functional forms
 
 ## distance
 ### should be included as linear spline with knots at 1.5 and 2.8
@@ -76,7 +96,11 @@ ggplot(data = hotels_Rome, aes(x=distance2, y=highly_rated)) +
   scale_y_continuous(expand = c(0.01,0.01), limits = c(0,1), breaks = seq(0,1,0.1)) +
   labs(x = "Distance",y = "Probability of being highly rated") +
   theme_bw()
+```
+Stars: The simple lpm model of *highly_rated ~ stars* shows us the probability of being highly rated per stars (the ratio of highly rated hotels within total number per the stars category)
 
+From this we learn that the more stars, the higher the rating (about linear) 
+```{r, echo=FALSE, warning=FALSE, include=FALSE, message = FALSE,  fig.width=8, fig.height = 3, fig.align="center" }
 ## starts
 ### highest probability is for star 3 and 4
 lpm0 <- lm(highly_rated ~ stars, data=hotels_Rome)
@@ -86,19 +110,35 @@ hotels_Rome<-hotels_Rome %>%
   group_by(stars, highly_rated) %>%
   mutate(weight = n())  %>%
   mutate(weight_2=(weight/1000))
+```
+
+```{r, echo=FALSE, warning=FALSE, fig.width=8, fig.height = 3, fig.align="center" }
 ggplot(data = hotels_Rome, label=stars) +
-  geom_point(aes(x = stars, y = pred0), size = 1,shape = 16) +
-  geom_line(aes(x = stars, y = pred0), size=0.7) +
+  geom_point(aes(x = stars, y = pred0), size = 1,shape = 16, fill = "blue") +
+  geom_line(aes(x = stars, y = pred0), size=0.7, color = "blue") +
   geom_point(aes(x = stars, y = highly_rated, size=weight_2), shape = 16, alpha=0.8, show.legend=F, na.rm=TRUE)  +
-  labs(x = "Stars",y = "Probability of being highly rated")+
+  labs(x = "Stars",y = "Probability of being highly rated") +
   theme_bw() 
+```
+## Probability models
 
-table(hotels_Rome$highly_rated, hotels_Rome$stars)
-table(hotels_Rome$highly_rated, hotels_Rome$pred0)
+I have created five models:
 
+- 3 LPM models, one with distance as linear variable, one with distance as lspline with knots at 1.5 and 2.8, and one with distance as lspline and stars as well
+- A logit model with distance as lspline with knots at 1.5 and 2.8, and stars
+- A probit model with distance as lspline with knots at 1.5 and 2.8, and stars
+
+```{r, echo=FALSE, warning=FALSE, include=FALSE,  fig.width=4, fig.height = 3, fig.align="center" }
 #######################################################
 # ROBABILITY MODELS (LPM, LOGIT, PROBIT) & PREDICTION #
 #######################################################
+
+library(kableExtra)
+library(tidyverse)
+library(huxtable)
+library(modelsummary)
+library(lspline)
+library(mfx)
 
 #   LPM 1  reg1: NO control, simple linear regression
 lpm1 <-lm(highly_rated ~ distance2, data=hotels_Rome)
@@ -126,10 +166,26 @@ probit <- glm(highly_rated ~ stars + lspline(distance2, c(1.5, 2.8)), data=hotel
 # probit marginal differences
 probit_marg <- probitmfx(formula = highly_rated ~ stars + lspline(distance2, c(1.5, 2.8)), data=hotels_Rome, atmean=FALSE)
 
+
+```
+
+## Results
+
+- all results are statistically signifant at p=5% at least
+- lpm1  shows that on avg. if distance is 1 km higher, rating is lower by 0.036
+- lpm2 shows the coefficient is negative for <1.5 km and >2.8 km, but positive for 1.5-2.8 km segment. Meaning that in  1.5-2.8 km range, hotels that are further away by 1 km have a higher rating by 0.140 on avg.
+- In lmp3, introducing stars as a variable decreases the coefficient for distance in the 1st and (from -0.301 to -0.241) and in the 2nd segment (from 0.14 to 0.072), but not in the 3rd segment. From this we can conclude, that if d<1.5 km then 1 km higher distance from the center has a more significant impact that 1 more stars, but in the 1.5-2.8 km segment stars are more important, and in the d>2.8 km segment stars and distance are equally important.
+- the logit and probit models have almost same coefficients as the lmp3 model (se figure below)
+
+```{r, echo=FALSE, warning=FALSE, fig.width=4, fig.height = 3, fig.align="center" }
 huxreg("lpm1"=lpm1, "lpm2"=lpm2, "lpm3"=lpm3, "logit_marg"=logit_marg, "probit_marg"=probit_marg,
        statistics = c(N = "nobs"),
        coefs = c("distance"="distance2","stars"= "stars", "dist<1.5"="lspline(distance2, c(1.5, 2.8))1", "1.5<dist<2.8"="lspline(distance2, c(1.5, 2.8))2", "dist>2.8"="lspline(distance2, c(1.5, 2.8))3"))
+```
 
+## Predictions
+- predictions as expected, close to lmp model, with divergence in the lower and higer range
+```{r, echo=FALSE, warning=FALSE, include=FALSE}
 ################################################################################
 # PREDICTIONS
 ################################################################################
@@ -142,14 +198,19 @@ hotels_Rome$pred_probit <- predict.glm(probit, type="response")
 
 dt_pred <- data.table(hotels_Rome)
 dt_pred[,list(mean_lpm1=mean(pred_lpm1), mean_lpm2=mean(pred_lpm2), mean_lpm3=mean(pred_lpm3),mean_logit=mean(pred_logit), mean_probit=mean(pred_probit)),by=list(highly_rated)]
+```
 
+
+```{r, echo=FALSE, warning=FALSE, out.width="60%", fig.width=3, fig.height = 2, fig.align="center" }
 ggplot(data = hotels_Rome) +
   geom_point(  aes( y = pred_lpm3, x=pred_lpm3), alpha=0.2, color="blue") +
   geom_point(  aes( y = pred_logit, x=pred_lpm3), alpha=0.2, color="red") +
   geom_point(  aes( y = pred_probit, x=pred_lpm3), alpha=0.1, color="green") +
-  labs( x = "Predicted probability by lpm3 model" , y = 'Predicted probability of logit and probit model' ) +
+  labs( x = "Predicted probability by lpm3 model" , y = 'Predicted probability of logit and probit' ) +
   scale_x_continuous(limits = c(0,1)) +
   theme_bw()
+
+```
 
 
 

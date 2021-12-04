@@ -1,3 +1,11 @@
+---
+title: "Assignment 2"
+author: "Gyebnar Daniel"
+date: '2021 12 04 '
+output: pdf_document
+---
+
+```{r}
 ##################
 # Assignment 2   #
 #                #
@@ -13,8 +21,6 @@ library(kableExtra)
 library(tidyverse)
 library(huxtable)
 library(modelsummary)
-library(lspline)
-library(mfx)
 
 
 # load in data and create workfile
@@ -152,4 +158,7 @@ ggplot(data = hotels_Rome) +
   theme_bw()
 
 
+
+
+```
 
