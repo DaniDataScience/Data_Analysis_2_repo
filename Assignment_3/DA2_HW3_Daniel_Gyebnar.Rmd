@@ -1,0 +1,629 @@
+---
+title: "Analysis of real estate unit prices"
+output: 
+  pdf_document:
+    extra_dependencies: ["float"]
+---
+
+```{r setup, include=FALSE}
+#knitr::opts_chunk$set(fig.pos = "!H", out.extra = "")
+# Set graph size
+#knitr::opts_chunk$set(echo = FALSE, out.width = "50%" )#fig.asp = 0.5, fig.width = 7, out.width = "90%" )
+
+rm(list=ls())
+
+# Libraries
+#install.packages("AER")
+library(AER)
+library(tidyverse)
+library(lspline)
+library(modelsummary)
+library(ggpubr)
+library(dplyr)
+library(estimatr)
+# Extra for correlation heatmap
+library(reshape2)
+library(kableExtra)
+
+```
+
+## Introduction
+
+This project aims to analyze the average pattern of association between the unit price of houses and the size (living area) of the house, and reveal additional key attributes of the house that influences this relationship.
+With this project I aim to gain deeper understanding on the real estate market's pricing mechanisms, and see what attributes of a house elevates its market value.
+
+My research question is: 
+What is the average pattern of association between the area and the unit price of a house, and what are the additional important factors that influence this relationship?
+
+My initial hypothesis is that unit price decreases by size, and given two houses with the same size, the key differentiating factors are the lot size, the quality of the building, and the neighborhood.
+
+My left-hand side (Y) variable is the unit price of houses, in USD per square feet.
+My main right hand side variable is the area of the house, in square feet.
+I considered the log transformation of these variables and I used additional confoundres (attributes of houses) to reveal the relationship.
+
+## Data
+
+To analyze this question, I have obtained a dataset on houses sold in King County, USA, from 2014.05 to 2015.05.
+
+Datasource: The Center for Spatial Data Science, University of Chicago
+https://geodacenter.github.io/data-and-lab//KingCounty-HouseSales2015/
+
+The dataset contains 21,613 observations, and 21 variables. 
+The description of all the variables can be found in the Appendix.
+
+The data was obtained already in a cleaned format.
+I have excluded observations with no bedrooms, bathrooms, and with lots that are 100 times larger than the house. These observations are likely to not describe houses but other buildings or just the lot.
+
+The model should reach high external validity, as I have excluded variables which are specific to King County: ZIP code, latitude, longitude, average values of 15 nearest houses.
+
+I  modified the remaining variables to prepare the data set for the analysis.
+The key variables and modifications I made can be found in the table below, and the distributions of the transformed  variables can be found in the Appendix.:
+```{r, echo=FALSE, message=FALSE}
+# reading data
+df_raw <- read_csv("https://raw.githubusercontent.com/DaniDataScience/Data_Analysis_2_repo/main/Assignment_3/kc_house_data.csv")
+
+# adding Y
+df_raw$pps <- df_raw$price/df_raw$sqft_living
+
+# cleaning duplicates
+dfx <- df_raw %>% group_by(id) %>% filter(n()>1) %>% arrange(id, date)  #selecting duplicates
+dfx <- dfx[ c(seq(1,nrow(dfx),2)),]   #selecting the older record
+df <- anti_join(df_raw, dfx)  #deselecting older record from data table
+rm(dfx)
+
+# sample selection
+df <- df_raw %>% 
+  filter(bedrooms <=10 & bedrooms !=0) %>% # restricting large mansions
+  filter(sqft_living/sqft_lot > 0.01) %>% # filtering extreme large lots
+  filter(bathrooms > 0.5)
+
+# creating variables
+df$ln_living <- log(df$sqft_living)
+df$ln_lot <- log(df$sqft_lot)
+df$ln_pps <- log(df$pps)
+df$ln_price <- log(df$price)
+
+# use age of the building instead of ear built
+df$age <- 2015-df$yr_built  
+
+# create bins for year of renovations, (now 0 is included as no renovation)
+df <- df %>% mutate(renovation_bin = 0 +
+                      1*as.numeric(df$yr_renovated >= 1980) +
+                      1*as.numeric(df$yr_renovated >= 2000)) 
+
+df <- df %>%  mutate(renovation_bin = dplyr::recode(renovation_bin, 
+                                             "0" = "Not or before 1980",
+                                             "1" = "1980-2000", 
+                                             "2" = "Since 2000"))
+
+df$renovation_bin <- factor(df$renovation_bin, level=c("Not or before 1980","1980-2000","Since 2000"))
+
+# creating larger bins for categorical variables with too few observations
+
+# number of bathrooms -> to few observations above 4
+df$bathrooms <- round(df$bathrooms)
+df <- df %>% mutate(bathrooms2 =
+                      df$bathrooms*as.numeric(df$bathrooms <= 4) +
+                      5*as.numeric(df$bathrooms >= 5)) 
+
+# number of bedrooms -> to few observations above 6
+df <- df %>% mutate(bedrooms2 =
+                      df$bedrooms*as.numeric(df$bedrooms <= 5) +
+                      6*as.numeric(df$bedrooms >= 6)) 
+
+# grade -> to few observations below 5 and above 11
+df <- df %>% mutate(grade2 =
+                      1*as.numeric(df$grade <= 5) +
+                      (df$grade-4)*as.numeric(df$grade <= 10 & df$grade >= 6) +
+                      11*as.numeric(df$grade >= 11)) 
+df <- df %>%  mutate(grade2 = dplyr::recode(grade2,
+                                        "1" = 1, 
+                                        "2" = 2, 
+                                        "3" = 3, 
+                                        "4" = 4, 
+                                        "5" = 5,
+                                        "6" = 6,
+                                        "11" = 7))
+
+# view -> at least 300 observations in each bin, bin 1-2-3 has similar mean
+df <- df %>% mutate(view2 =
+                      (df$view-1)*as.numeric(df$view == 2) +
+                      (df$view-2)*as.numeric(df$view == 3) +
+                      2*as.numeric(df$view >= 4)) 
+
+# condition -> can merge 1&2
+df <- df %>% mutate(condition2 =
+                      1*as.numeric(df$condition <= 2) +
+                      (df$condition-1)*as.numeric(df$condition >= 3)
+                    ) 
+
+# selecting potential confounders
+df <- df %>% dplyr::select( id, date,
+                            ln_pps, ln_living,
+                            ln_lot, bedrooms2, bathrooms2,
+                            condition2, grade2, age, renovation_bin,
+                            waterfront, view2
+) %>% drop_na()
+
+variables <- c("ln_pps",
+               "ln_living",
+               "grade2",
+               "ln_lot",
+               "age",
+               "bathrooms2",
+               "bedrooms2",
+               "condition2",
+               "view2",
+               "waterfront",
+               "renovation_bin")
+
+describtion <- c( "The natural logarithm of the ratio of price and living area (Y variable)",
+                  "The natural logarithm of size of the house's living area in square feet",
+                  "Classification by construction quality, referring to  types of materials and workmanship from 1 to 7",
+                  "The natural logarithm of the lot area",
+                  "Time passed in years between the construction year and present (2015)",
+                  "Number of bathrooms from 1 to 5+",
+                  "Number of bedrooms from 1 to 6+",
+                  "Condition of the house, ranked from 1 to 5",
+                  "An index from 0 to 2 of how good the view of the property was",
+                  "‘1’ if the property has a waterfront, ‘0’ if not",
+                  "Renovation status of the building, with renovated since 2000, since 1980, or before 1980 or never"
+                  )
+
+transformation <- c("Natural logarithm, to shift skewed distribution to normal, and to be able to talk about differences", 
+                    "Natural logarithm, to to shift skewed distribution to normal, and to be able to talk about differences",
+                    "Condensing original 11 bins into 7 bins to avoid bind with few (<100) observations",
+                    "Natural logarithm, to shift skewed distribution to normal, and to be able to talk about differences",
+                    "Transforming year built to age",
+                    "Condensing actual number of bathrooms to bins 1-5+, due to too few observations (>100) in some binss",
+                    "Condensing actual number of bedrooms to bins 1-6+, due to too few observations (>100) in some binss",
+                    "Condensing to bins 1-4, due to too few observations (>100) in some bins",
+                    "Condensing to bins 0-2, due to too few observations (>100) in some bins",
+                    "No transformation",
+                    "Creating renovation bin from year of renovation")
+
+
+data_descr2 <- data.frame("Variable" = variables, "Description"=describtion, "Transformation"=transformation)
+
+kable(data_descr2, "latex", booktabs = T) %>%
+column_spec(2:3, width = "7cm") %>%
+kable_styling(latex_options = c("striped", "scale_down")) %>% 
+kable_styling(latex_options = c("HOLD_position","scale_down"))
+```
+
+In the raw dataset, both price and living area had a log distribution, as can be seen in the Appendix. Thus their ratio, the price per square feet, was  skewed to the right (Y variable), . 
+This was also true for my X variable, living area. 
+
+The log transformation of Y and X ensured that these variables are normally distributed. The interpretation of the results are also more favorable this way, by being able to talk about price differences in realtive terms.
+
+The mean and the median are very close to each other for both variables as can be seen below:
+```{r, echo=FALSE, warning=FALSE, fig.width=8, fig.height = 3, fig.align="center" }
+# ln_pps
+p1 <- ggplot(df) +
+  geom_histogram(aes(x=df$ln_pps, y = ..density..),bins=50, fill="navyblue", color="white") +
+  scale_x_continuous( limits = c( 4 , 7 ) ) +
+  labs( x = "Y - Ln(Price per square foot [USD])" , y = 'Relative Frequency', fill = "female" ) +
+  geom_segment( aes(x = mean( df$ln_pps , na.rm = T ), y = 0, xend = mean( df$ln_pps , na.rm = T ), yend = 1.1) , color = 'red', size = 1.5 ) + 
+  annotate( "text" , size=3, x = mean( df$ln_pps , na.rm = T )+0.3 , y = 1.1 , label = 'Mean' , color = 'red') +
+  annotate( "text" , size=3, x = mean( df$ln_pps , na.rm = T )+0.3 , y = 1.05 , label = round(mean( df$ln_pps , na.rm = T ),3) , color = 'red') +
+  geom_segment( aes(x = median( df$ln_pps , na.rm = T ), y = 0, xend = median( df$ln_pps , na.rm = T ), yend = 1.1) , color = 'orange', size = 0.5 ) + 
+  annotate( "text" , size=3, x = median( df$ln_pps , na.rm = T )-0.3 , y = 1.1 , label = 'Median' , color = 'orange') +
+  annotate( "text" , size=3, x = median( df$ln_pps , na.rm = T )-0.3 , y = 1.05 , label = round(median( df$ln_pps , na.rm = T ),3) , color = 'orange') +  theme_bw()
+
+
+# ln_living
+p2 <- ggplot(df) +
+  geom_histogram(aes(x=df$ln_living, y = ..density..),bins=50, fill="navyblue", color="white") +
+  scale_x_continuous( limits = c( 6 , 9 ) ) +
+  labs( x = "X - Ln(Living space [square foot])" , y = 'Relative Frequency', fill = "female" ) +
+  geom_segment( aes(x = mean( df$ln_living , na.rm = T ), y = 0, xend = mean( df$ln_living , na.rm = T ), yend = 1.1) , color = 'red', size = 1.5 ) + 
+  annotate( "text" , size=3, x = mean( df$ln_living , na.rm = T )+0.3 , y = 1.1 , label = 'Mean' , color = 'red') +
+  annotate( "text" , size=3, x = mean( df$ln_living , na.rm = T )+0.3 , y = 1.05 , label = round(mean( df$ln_living , na.rm = T ),3) , color = 'red') +
+  geom_segment( aes(x = median( df$ln_living , na.rm = T ), y = 0, xend = median( df$ln_living , na.rm = T ), yend = 1.1) , color = 'orange', size = 0.5 ) + 
+  annotate( "text" , size=3, x = median( df$ln_living , na.rm = T )-0.3 , y = 1.1 , label = 'Median' , color = 'orange') +
+  annotate( "text" , size=3, x = median( df$ln_living , na.rm = T )-0.3 , y = 1.05 , label = round(median( df$ln_living , na.rm = T ),3) , color = 'orange') +  theme_bw()
+
+
+association_figs <- ggarrange(p1, p2,
+                       hjust = -0.6,
+                       ncol = 2, nrow = 1)
+association_figs
+
+```
+\pagebreak
+The scatter plot below of X and Y variables reveals that the average pattern of association suggests larger houses have a lower unit price, but only up to a certain point. Near log(x)=7.7 the loess slope changes from negative to positive. Meaning that for large houses, my initial hypotheses could be false. 
+
+In the model, I will include ln_living as a linear spline with a knot at 7.7. I will test whether the two segments really have a different slope.
+
+```{r, echo=FALSE, warning=FALSE, fig.width=8, fig.height = 3, fig.align="center" }
+
+  ggplot( df , aes(x = ln_living, y = ln_pps)) +
+    geom_point(color='red',size=0.1,alpha=0.6) +
+    geom_smooth(method="loess" , formula = y ~ x ) +
+    labs(x = "Ln(Living space [square fott])", y = "Ln(Price per squarefoot [USD])") +
+    theme_bw()
+
+```
+
+
+To better explain the relationship between Y and X, I considered to include confounders.
+
+I chose how to model each confounder as described in the table below.
+Figures of the relationship between the confounderes and Y can be found in the Appendix to support my decisions.
+
+```{r, echo=FALSE, warning=FALSE, fig.width=4, fig.height = 3, fig.align="center" }
+variables <- c("grade2",
+               "ln_lot",
+               "age",
+               "bathrooms2",
+               "bedrooms2",
+               "condition2",
+               "view2",
+               "waterfront",
+               "renovation")
+
+model <- c(    "Include as a dummy variable to capture the non-linear increase of means per grades",
+               "Include as linear spline with a knot at 9.0",
+               "Loess suggests a third-order relationship, but for the sake of better interpretation I wil use linear spline with a knot at 25",
+               "Include as a dummy variable to capture the increasing differences of means per number of bathrooms",
+               "Include as a dummy variable to capture the de/increasing differences of means per number of bedrooms",
+               "Include as a dummy variable to capture the non-uniformly increasing differences of means per condition level",
+               "Include as a dummy variable to capture the increasing differences of means per view level",
+               "Include as a binry dummy variable",
+               "Include as a dummy variable with 3 levels")
+
+trans_descr <- data.frame("Variable" = variables, "Modeling method"=model)
+
+library(kableExtra)
+kable(trans_descr, "latex", booktabs = T) %>%
+column_spec(1:4, width = "7cm") %>%
+kable_styling(latex_options = c("striped", "scale_down")) %>% 
+kable_styling(latex_options = c("HOLD_position","scale_down"))
+
+```
+\pagebreak
+## Model
+```{r, echo = FALSE }
+
+#reg1
+reg1 <- lm_robust(ln_pps ~ ln_living, data=df, se_type = "HC1")
+
+#reg2
+reg2 <- lm_robust(ln_pps ~ lspline(ln_living, c(7.7)), data=df, se_type = "HC1")
+
+
+# control for grade and condition:
+reg3 <- lm_robust(ln_pps ~  lspline(ln_living, c(7.7)) + as.factor(grade2) + as.factor(condition2) , data=df, se_type = "HC1")
+
+# control for lot size:
+reg4 <- lm_robust(ln_pps ~  lspline(ln_living, c(7.7)) + as.factor(grade2) + as.factor(condition2) + lspline(ln_lot, c(9)) , data=df, se_type = "HC1")
+
+# control for age:
+reg5 <- lm_robust(ln_pps ~  lspline(ln_living, c(7.7)) + as.factor(grade2) + as.factor(condition2) + lspline(ln_lot, c(9)) + lspline(age, c(25)) , data=df, se_type = "HC1")
+
+# control for view and waterfront:
+reg6 <- lm_robust(ln_pps ~  lspline(ln_living, c(7.7)) + as.factor(grade2) + as.factor(condition2) + lspline(ln_lot, c(9)) + lspline(age, c(25)) + as.factor(view2) + as.factor(waterfront) , data=df, se_type = "HC1")
+
+# control for number of bathrooms
+reg7 <- lm_robust(ln_pps ~  lspline(ln_living, c(7.7)) + as.factor(grade2) + as.factor(condition2) + lspline(ln_lot, c(9)) + lspline(age, c(25)) + as.factor(view2) + as.factor(waterfront) + as.factor(bathrooms2)  , data=df, se_type = "HC1")
+
+# adding all variables
+reg_all <- lm_robust(ln_pps ~  
+                       lspline(ln_living, c(7.7)) +
+                       as.factor(grade2) + as.factor(condition2) + 
+                       lspline(ln_lot, c(9)) + 
+                       lspline(age, c(25)) + 
+                       as.factor(view2) + as.factor(waterfront) +
+                       as.factor(bathrooms2) +
+                       as.factor(bedrooms2) +
+                       as.factor(renovation_bin)
+                     , data=df, se_type = "HC1")
+
+
+```
+
+```{r, echo=FALSE, warning=FALSE,message=FALSE, fig.width=4, fig.height = 3, fig.align="center" }
+
+library(knitr)
+library(kableExtra)
+
+msummary(list("reg1"=reg2, "reg2"=reg3, "reg3"=reg4, "reg4"=reg5, "reg5"=reg6, "reg6"=reg7, "reg_all"=reg_all),
+         fmt="%.3f",
+         gof_omit = 'DF|Deviance|Log.Lik.|F|R2 Adj.|AIC|BIC',
+         stars=c('*' = .05, '**' = .01),
+         coef_rename=c("(Intercept)" = "Constant",
+                       "lspline(ln_living, c(7.7))1" = "ln_living<7.7",
+                       "lspline(ln_living, c(7.7))2" = "ln_living>7.7",
+                       "as.factor(grade2)2" = "f(grade=2)",
+                       "as.factor(grade2)3" = "f(grade=3)",
+                       "as.factor(grade2)4" = "f(grade=4)",
+                       "as.factor(grade2)5" = "f(grade=5)",
+                       "as.factor(grade2)6" = "f(grade=6)",
+                       "as.factor(grade2)7" = "f(grade=7)",
+                       "lspline(ln_lot, c(9))1" = "ln_lot<9",
+                       "lspline(ln_lot, c(9))2" = "ln_lot>9",
+                       "lspline(age, c(25))1" = "age<25",
+                       "lspline(age, c(25))2" = "age>25",
+                       "as.factor(view2)1" = "f(view=1)",
+                       "as.factor(view2)2" = "f(view=2)",
+                       "as.factor(bathrooms2)2" = "f(bathrooms=2)",
+                       "as.factor(bathrooms2)3" = "f(bathrooms=3)",
+                       "as.factor(bathrooms2)4" = "f(bathrooms=4)",
+                       "as.factor(bathrooms2)5" = "f(bathrooms=5+)",
+                       "as.factor(bedrooms2)2" = "f(bedrooms=2)",
+                       "as.factor(bedrooms2)3" = "f(bedrooms=3)",
+                       "as.factor(bedrooms2)4" = "f(bedrooms=4)",
+                       "as.factor(bedrooms2)5" = "f(bedrooms=5)",
+                       "as.factor(bedrooms2)6" = "f(bedrooms=6+)",
+                       "as.factor(condition2)2" = "f(condition=2)",
+                       "as.factor(condition2)3" = "f(condition=3)",
+                       "as.factor(condition2)4" = "f(condition=4)",
+                       "as.factor(waterfront)1" = "waterfront",
+                       "as.factor(renovation_bin)1980-2000" = "Renovated: 1980-2000",
+                       "as.factor(renovation_bin)Since 2000" = "Renovated since 2000")
+         ) %>% 
+column_spec(1:2, width = "2cm") %>%
+kable_styling(latex_options = c("striped", "HOLD_position"), font_size=7)
+```
+I included 5 models, adding increasingly more variables, and a final model that contains all variables. The result of my models are summarized in the table above.
+
+Holistic description of model results:
+
+- In all models the slope of the living area (X variable) in both the two linear spline segments (>7.7 and <7.7) are both statistically significant and different from each other, as the CI intervals do not overlap
+-By adding more confounders, the slope of the <7.7 segment decreases, and the slope of the >7.7 segment increases
+- The R square increases from 0.086 by adding more and more confounders, however it only reaches 0.408 by adding all variables. This means the model only explains c.41% of the variation, and there is still a significant amount of noise included
+- Adding number of bedrooms and renovation status to Regression 6  increased the R square from 0.405 to 0.408 only, and decreases the slope of the living area (X variable) in the <7.7 segment
+- Renovation stat
+
+My preferred model is Regression 7, from which we can draw the following conclusions:
+
+- The higher the living area, the lower the unit price is on average
+- For  houses with a log living area below 7.7, houses with a living area larger by 1% have 0.61% lower unit price on average, (given that allo other variables are the same)
+- For  houses with a log living area above 7.7, this relationship is weaker: houses with a living area larger by 1% have 0.38% lower unit price on average, given that allo other variables are the same. 
+- This can be explained with large houses being more high-end, where the quality and other external attributes have a higher importance
+- Two variables are omitted: number of bedrooms and renovation status
+
+Interpretation of grade:
+- The higher the grade, the higher the unit price, e.g. a grade 7 house being 1.29 times more expensive compared to a grade 1 house on average, (given that all other variables are the same
+- All grade levels are statistically significant
+
+Interpretation of condition: 
+- The better the condition, the higher the unit price, e.g. a condition 4 house having a 23% higher price compared to a condition 1 house on average, given that all other variables are the same
+- All condition levels are statistically significant
+
+Interpretation of lot size: 
+- For houses with log lot size smaller than 9.0, houses with a 1% larger lot size have 0.135% higer unit price on average, given that all other variables are the same
+- For houses with log lot size larger than 9.0, houses with a 1% larger lot size have 0.01% higer unit price on average, given that all other variables are the same
+- All condition levels are statistically significant
+
+Interpretation of age:
+- Below age 25, the result is statistically not significant, meaning age has no effect below 25 years
+- Houses older than 25 years have a higher unit price, with 1 year older house being 0.6% more expensive on average, given that all other variables are the same
+
+Interpretation of view:
+- Houses with a better view have higher unit price on average, .e.g. a view level 2 house has 26% higher unit price on average compared to a house with no view (view level 0), given that all other variables are the same
+
+Interpretation of waterfront:
+- Houses with access to the water have a 35% higer unit price on average, than houses with no waterfront access, given that all other variables are the same
+
+Interpretation of bathrooms:
+- Houses with more bathrooms have a hiher unit price, e.g. a house with 5+ bathrooms have a 24% higher unit price on average than houses with 1 bathrooms, given that all other variables are the same
+- The increase in unit price per one more bathroom is close to exponential
+
+## External validity
+
+The model has high external validity in time.
+
+To check this, I split the dataset into two parts to check external validity in time. I inclded 5000 observations into a dataset starting from the first observation's date (2014-05 month) and I included 5000 observations into another dataset going back from the last observation's date (2015-05).
+
+From the results we can conclude that the model has high external validity in time: even though the coefficients are somewhat different, they are not significantly different.
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.width=4, fig.height = 3, fig.align="center" }
+
+df$date <- as.Date(df$date, "%Y-%m-%d")
+typeof(df$date)
+library(tidyr)
+
+#four month from 2014-05 to 2014-07
+df1 <- df %>% arrange(date) %>% head(5000)
+#four month from 2015-02 to 2015-05
+df2 <- df %>% arrange(date) %>% tail(5000)
+
+
+reg7_1 <- lm_robust(ln_pps ~  lspline(ln_living, c(7.7)) + as.factor(grade2) + as.factor(condition2) + lspline(ln_lot, c(9)) + lspline(age, c(25)) + as.factor(view2) + as.factor(waterfront) + as.factor(bathrooms2)  , data=df1, se_type = "HC1")
+
+reg7_2 <- lm_robust(ln_pps ~  lspline(ln_living, c(7.7)) + as.factor(grade2) + as.factor(condition2) + lspline(ln_lot, c(9)) + lspline(age, c(25)) + as.factor(view2) + as.factor(waterfront) + as.factor(bathrooms2)  , data=df2, se_type = "HC1")
+
+options(modelsummary_factory_latex = 'kableExtra')
+
+library(knitr)
+library(kableExtra)
+
+msummary(list("reg-2014-May-June"=reg7_1, "reg-2015-Feb-May"=reg7_2),
+         fmt="%.3f",
+         gof_omit = 'DF|Deviance|Log.Lik.|F|R2 Adj.|AIC|BIC',
+         stars=c('*' = .05, '**' = .01),
+         coef_rename=c("(Intercept)" = "Constant",
+                       "lspline(ln_living, c(7.7))1" = "ln_living<7.7",
+                       "lspline(ln_living, c(7.7))2" = "ln_living>7.7",
+                       "as.factor(grade2)2" = "f(grade=2)",
+                       "as.factor(grade2)3" = "f(grade=3)",
+                       "as.factor(grade2)4" = "f(grade=4)",
+                       "as.factor(grade2)5" = "f(grade=5)",
+                       "as.factor(grade2)6" = "f(grade=6)",
+                       "as.factor(grade2)7" = "f(grade=7)",
+                       "lspline(ln_lot, c(9))1" = "ln_lot<9",
+                       "lspline(ln_lot, c(9))2" = "ln_lot>9",
+                       "lspline(age, c(25))1" = "age<25",
+                       "lspline(age, c(25))2" = "age>25",
+                       "as.factor(view2)1" = "f(view=1)",
+                       "as.factor(view2)2" = "f(view=2)",
+                       "as.factor(bathrooms2)2" = "f(bathrooms=2)",
+                       "as.factor(bathrooms2)3" = "f(bathrooms=3)",
+                       "as.factor(bathrooms2)4" = "f(bathrooms=4)",
+                       "as.factor(bathrooms2)5" = "f(bathrooms=5+)",
+                       "as.factor(bedrooms2)2" = "f(bedrooms=2)",
+                       "as.factor(bedrooms2)3" = "f(bedrooms=3)",
+                       "as.factor(bedrooms2)4" = "f(bedrooms=4)",
+                       "as.factor(bedrooms2)5" = "f(bedrooms=5)",
+                       "as.factor(bedrooms2)6" = "f(bedrooms=6+)",
+                       "as.factor(condition2)2" = "f(condition=2)",
+                       "as.factor(condition2)3" = "f(condition=3)",
+                       "as.factor(condition2)4" = "f(condition=4)",
+                       "as.factor(waterfront)1" = "waterfront",
+                       "as.factor(renovation_bin)1980-2000" = "Renovated: 1980-2000",
+                       "as.factor(renovation_bin)Since 2000" = "Renovated since 2000")
+         )%>% 
+column_spec(1:2, width = "2cm") %>%
+kable_styling(latex_options = c("striped", "HOLD_position"), font_size=7)
+
+```
+## Conclusion
+
+To anwser my research question: Houses with alrger living area are indeed cheaper. This is more true for houses with a log living area below 7.7. 
+
+A key confounder is grade, determining the quality of materials and workmanship. Meaning that in case of two houses with same living area, the grade will be the key differentiating factor in their unit prices.
+
+Additional important confounders are: waterfront, number of bathrooms, view, condition.
+Suprizingly, lot size is not as important as I initially considered it to be. 
+
+\newpage
+## Appendix
+
+Description of the original dataset:
+```{r, echo=FALSE, message=FALSE,}
+variables <- c("id","date","price","bedrooms","bathrooms","sqft_liv","sqft_lot",
+               "floors","waterfront","view","condition","grade","sqft_above",
+               "sqft_basmt","yr_built","yr_renov","zipcode","lat","long",
+               "squft_liv15","squft_lot15","Shape_leng","Shape_Area")
+
+describtion <- c( "Identification","Date sold","Sale price [USD]",
+                 "Number of bedrooms","Number of bathrooms","Size of living area in square feet",
+                 "Size of the lot in square feet","Number of floors",
+                 "‘1’ if the property has a waterfront, ‘0’ if not.",
+                 "An index from 0 to 4 of how good the view of the property was",
+                 "Condition of the house, ranked from 1 to 5",
+                 "Classification by construction quality which refers to the types of materials used and the quality of workmanship",
+                 "Square feet above ground","Square feet below ground","Year built",
+                 "Year renovated. ‘0’ if never renovated","5 digit zip code",
+                 "Latitude","Longitude",
+                 "Average size of interior housing living space for the closest 15 houses, in square feet",
+                 "Average size of land lots for the closest 15 houses, in square feet",
+                 "Polygon length in meters","Polygon area in meters")
+
+data_descr <- data.frame("Variable" = variables, "Description"=describtion)
+
+kable(data_descr, "latex", booktabs = T) %>%
+column_spec(1:4, width = "7cm") %>%
+kable_styling(latex_options = c("striped", "scale_down")) %>% 
+kable_styling(latex_options = c("HOLD_position","scale_down"))
+```
+\newpage
+Distributions of the variables in the original dataset:
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.width=8, fig.height = 8, fig.align="center" }
+df_raw %>%
+  keep(is.numeric) %>% 
+  gather() %>% 
+  ggplot(aes(value), color="navyblue") +
+  theme_bw()+
+  facet_wrap(~key, scales = "free") +
+  geom_histogram()
+```
+\newpage
+Distributions of the variables in the transformed dataset:
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.width=8, fig.height = 8, fig.align="center" }
+df %>%
+  keep(is.numeric) %>% 
+  gather() %>% 
+  ggplot(aes(value), color="navyblue") +
+  theme_bw()+
+  facet_wrap(~key, scales = "free") +
+  geom_histogram()
+```
+\newpage
+Grade2 and Unit price relation:
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.width=6, fig.height = 4, fig.align="center" }
+
+gr <- df %>% dplyr::select(grade2, ln_pps) %>% group_by(grade2) %>% summarise("ln_pps" = mean(ln_pps), weight=n())
+ggplot(data=gr, aes(y=ln_pps, x=as.factor(grade2))) +
+  geom_point( size=gr$weight/1000, color="red") + 
+  labs( x = "Y - Ln(Price per square foot [USD])" , y = 'Relative Frequency', fill = "female" ) +
+  theme_bw()
+rm(gr)
+```
+Lot size and Unit price relation:
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.width=6, fig.height = 4, fig.align="center" }
+
+ggplot( df , aes(x = ln_lot, y = ln_pps)) +
+    geom_point(color='red',size=0.1,alpha=0.6) +
+    geom_smooth(method="loess" , formula = y ~ x ) +
+    labs(x = "Ln(Lot area [sqft])", y = "Ln(Price per squarefoot [USD])") +
+    theme_bw()
+```
+\newpage
+Age and Unit price relation:
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.width=6, fig.height = 4, fig.align="center" }
+
+age <- df %>% dplyr::select(age, ln_pps) %>%  group_by(age)  %>% summarise("ln_pps" = mean(ln_pps), weight=n())
+ggplot(data=age, aes(y=ln_pps, x=age)) +
+  geom_point(size=age$weight/100, color="red") +
+  geom_smooth(method="loess") +
+  labs(x = "Age of the house [years]", y = "Ln(Price per squarefoot [USD])") +
+  theme_bw()
+```
+Bathroom number and Unit price relation:
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.width=6, fig.height = 4, fig.align="center" }
+
+bt <- df %>% dplyr::select(bathrooms2, ln_pps) %>%  group_by(bathrooms2)  %>% summarise("ln_pps" = mean(ln_pps), weight=n())
+ggplot(data=bt, aes(y=ln_pps, x=as.factor(bathrooms2))) +
+  geom_point(size=bt$weight/1000, color="red") + 
+  labs(x = "Number of bathrooms", y = "Ln(Price per squarefoot [USD])") +
+  theme_bw()
+```
+\newpage
+Bedroom number and Unit price relation:
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.width=6, fig.height = 4, fig.align="center" }
+
+bd <- df %>% dplyr::select(bedrooms2, ln_pps) %>%  group_by(bedrooms2)  %>% summarise("ln_pps" = mean(ln_pps), weight=n())
+ggplot(data=bd, aes(y=ln_pps, x=as.factor(bedrooms2))) +
+  geom_point(size=bd$weight/1000, color="red") + 
+  labs(x = "Number of bedhrooms", y = "Ln(Price per squarefoot [USD])") +
+  theme_bw()
+```
+Condition2 and Unit price relation:
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.width=6, fig.height = 4, fig.align="center" }
+
+con <- df %>% dplyr::select(condition2, ln_pps) %>%  group_by(condition2)  %>% summarise("ln_pps" = mean(ln_pps), weight=n())
+ggplot(data=con, aes(y=con$ln_pps, x=as.factor(condition2))) +
+  geom_point(size=con$weight/1000, color="red") + 
+  labs(x = "Condition of the house", y = "Ln(Price per squarefoot [USD])") +
+  theme_bw()
+```
+\newpage
+View2 and Unit Price relation:
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.width=6, fig.height = 4, fig.align="center" }
+
+view <- df %>% dplyr::select(view2, ln_pps) %>%  group_by(view2)  %>% summarise("ln_pps" = mean(ln_pps), weight=n())
+ggplot(data=view, aes(y=ln_pps, x=as.factor(view2))) +
+  geom_point(size=view$weight/1000, color="red") + 
+  labs(x = "View from the house", y = "Ln(Price per squarefoot [USD])") +
+  theme_bw()
+```
+Waterfront and Unit Price relation:
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.width=6, fig.height = 4, fig.align="center" }
+
+wf <- df %>% dplyr::select(waterfront, ln_pps) %>%  group_by(waterfront)  %>% summarise("ln_pps" = mean(ln_pps), weight=n())
+ggplot(data=wf, aes(y=ln_pps, x=as.factor(waterfront))) +
+  geom_point(size=wf$weight/1000, color="red") + 
+  labs(x = "Does real estate have direct waterfront access", y = "Ln(Price per squarefoot [USD])") +
+  theme_bw() 
+```
+Renovation and Unit Price relation:
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.width=6, fig.height = 4, fig.align="center" }
+
+yrr <- df %>% dplyr::select(renovation_bin, ln_pps) %>%   group_by(renovation_bin)  %>% summarise("ln_pps" = mean(ln_pps), weight=n())
+ggplot(data=yrr, aes(y=ln_pps, x=factor(renovation_bin, levels=c("Not or before 1980", "1980-2000","Since 2000")))) +
+  geom_point(size=1, color="red") + 
+  labs(x = "Renovation status of the house", y = "Ln(Price per squarefoot [USD])") +
+  theme_bw()
+```
